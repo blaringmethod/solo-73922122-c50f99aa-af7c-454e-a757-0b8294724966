@@ -15,10 +15,8 @@ import threading
 import uuid
 from datetime import datetime, timezone
 
-import pyarrow.parquet as pq
-
 from . import config, storage
-from .db import LOCK, get_conn, next_file_seq
+from .db import LOCK, get_conn, next_file_seq, register_file
 
 TERMINAL_STATES = ("completed", "failed", "cancelled")
 ACTIVE_STATES = ("running", "paused", "switching")
@@ -230,8 +228,14 @@ class MergeManager:
 
             # 完整性校验通过后才允许切换
             storage.verify_output(tmp_path, total_rows)
+            # 产物索引直接从已写入的数据聚合得到：即使输入是旧的无索引文件，
+            # 产物也有完整索引；索引写入仍在下面的切换事务里提交。
+            out_ranges, out_min_us, out_max_us = writer.accumulated()
             try:
-                self._finish_switch(merge_id, tmp_path, total_rows)
+                self._finish_switch(
+                    merge_id, tmp_path, total_rows,
+                    out_ranges, out_min_us, out_max_us,
+                )
             except RuntimeError as exc:
                 # 切换阶段（含故障注入）失败：原输入文件保持 active
                 self._mark_failed(merge_id, "switch", exc, tmp_path)
@@ -240,7 +244,8 @@ class MergeManager:
             self._mark_failed(merge_id, "merge", exc, tmp_path)
 
     def _finish_switch(
-        self, merge_id: int, tmp_path: str, total_rows: int
+        self, merge_id: int, tmp_path: str, total_rows: int,
+        out_ranges, out_min_us: int | None, out_max_us: int | None,
     ) -> None:
         conn = get_conn()
         with LOCK:
@@ -273,12 +278,19 @@ class MergeManager:
             size = os.path.getsize(final_path)
 
             try:
-                conn.execute(
-                    """INSERT INTO files
-                       (file_id, kind, path, size_bytes, row_count, seq_order,
-                        read_order, status)
-                       VALUES (?, 'merged', ?, ?, ?, ?, ?, 'active')""",
-                    (file_uid, final_path, size, total_rows, seq, min_read_order),
+                # 产物登记与站点时间范围索引在同一事务提交
+                register_file(
+                    conn,
+                    file_id=file_uid,
+                    kind="merged",
+                    path=final_path,
+                    size_bytes=size,
+                    row_count=total_rows,
+                    seq_order=seq,
+                    read_order=min_read_order,
+                    ranges=out_ranges,
+                    min_observed_us=out_min_us,
+                    max_observed_us=out_max_us,
                 )
                 conn.execute(
                     "UPDATE files SET status='obsolete', obsolete_at=? "
@@ -373,7 +385,9 @@ class MergeManager:
             for m in interrupted:
                 tmp_path = _tmp_output_path(m["id"])
                 if m["state"] == "switching":
-                    # 切换事务未提交：输入文件仍是 active，原数据完好
+                    # 切换事务未提交：输入文件仍是 active，原数据完好。
+                    # 若进程在 os.replace 落位之后、事务提交之前退出，
+                    # 磁盘上会留下未登记到元数据的孤儿产物，一并清理。
                     conn.execute(
                         "UPDATE merges SET state='failed', fail_at_step='switch', "
                         "error=?, updated_at=? WHERE id=?",
@@ -382,6 +396,12 @@ class MergeManager:
                     )
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
+                    for name in os.listdir(config.FILES_DIR):
+                        if name.endswith(f"-merged-{m['id']}.parquet"):
+                            try:
+                                os.remove(os.path.join(config.FILES_DIR, name))
+                            except OSError:
+                                pass
                     result["failed_merges"].append(m["id"])
                 else:
                     # running/paused：保留任务，重启后台线程从头重写 tmp

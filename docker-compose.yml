@@ -1,7 +1,7 @@
 services:
   lakehouse:
     build: .
-    image: lakehouse-merge:1.0.0
+    image: lakehouse-merge:1.1.0
     container_name: lakehouse-merge
     ports:
       - "8000:8000"
@@ -9,6 +9,8 @@ services:
       DATA_DIR: /data
       MAX_UPLOAD_BYTES: "8388608"      # 8 MiB
       DEFAULT_PAGE_LIMIT: "1000"
+      # 筛选扫描的分块大小（每批读取行数，控制内存）
+      FILTER_BATCH_ROWS: "65536"
       AUTO_MERGE_ON_START: "false"
     volumes:
       - lakehouse-data:/data

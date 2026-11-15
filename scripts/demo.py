@@ -106,6 +106,15 @@ def drain_cursor(cli: Client, cursor_id: str, page_limit: int = 500,
             return rows
 
 
+def _create_filtered_checked(cli: Client, station_id: str,
+                             start: str, end: str) -> dict:
+    """创建筛选游标，并断言时段过滤语义与索引字段完整。"""
+    _, created = cli.call("POST", "/cursors", body=json.dumps({
+        "station_id": station_id, "start": start, "end": end}).encode())
+    assert created["filter"]["window"] == "[start, end)"
+    return created
+
+
 # ---------------------------------------------------------------- 主流程
 
 def cmd_demo(args) -> None:
@@ -118,9 +127,14 @@ def cmd_demo(args) -> None:
     section(f"2. 按顺序上传 {len(args.files)} 份合成 Parquet")
     total_rows = 0
     before_files = cli.call("GET", "/files")[1]["files"]
+    uploaded_ids: list[str] = []
+    uploaded_ranges: dict[str, tuple[str | None, str | None]] = {}
     for p in args.files:
         info = cli.upload(p)
         total_rows += info["row_count"]
+        uploaded_ids.append(info["file_id"])
+        uploaded_ranges[info["file_id"]] = (
+            info.get("observed_min"), info.get("observed_max"))
         print(f"  上传 {os.path.basename(p)} -> seq={info['seq_order']} "
               f"rows={info['row_count']} bytes={info['size_bytes']}")
     state["total_rows"] = total_rows
@@ -213,11 +227,65 @@ def cmd_demo(args) -> None:
     assert rows_c[:total_rows] == all_rows
     print(f"  新游标 C 读出 {len(rows_c)} 行，合并段行序与游标 A 完全一致")
 
-    section("9. 显式关闭游标，触发无引用旧文件回收")
+    section("9. 筛选游标：station_id + UTC 左闭右开时段，只返回命中行")
+    from datetime import datetime, timedelta
+
+    # 选一个跨若干文件的时段，验证多文件命中、索引可查
+    all_min = min(lo for lo, _ in uploaded_ranges.values() if lo)
+    all_max = max(hi for _, hi in uploaded_ranges.values() if hi)
+    print(f"  全部上传文件的时间范围: {all_min} .. {all_max}")
+    start_dt = datetime.fromisoformat(all_min)
+    start = all_min
+    end = (start_dt + timedelta(hours=2)).isoformat()
+    sid_filter = "ST-001"
+    _, fc = cli.call("POST", "/cursors", body=json.dumps({
+        "station_id": sid_filter, "start": start, "end": end}).encode(),
+        expect=(200,))
+    cursor_f = fc["cursor_id"]
+    state["cursor_f"] = cursor_f
+    print(f"  筛选游标 F = {cursor_f}，时段 [{start}, {end})，站点 {sid_filter}")
+    print(f"  候选文件 {fc['snapshot_files']} 个，索引跳过 "
+          f"{fc['files_skipped']} 个，候选行上界 {fc['candidate_rows']}")
+    rows_f: list[dict] = []
+    while True:
+        _, page = cli.call(
+            "GET", f"/cursors/{cursor_f}/pages?limit=7")
+        for r in page["rows"]:
+            assert r["station_id"] == sid_filter, "只允许返回命中站点"
+            assert start <= r["observed_at"] < end, "只允许返回时段内行"
+        rows_f.extend(page["rows"])
+        if page["exhausted"]:
+            print(f"  筛选游标耗尽：共 {page['total_rows']} 个命中行，"
+                  f"扫描原始行 {page['rows_read']} 行")
+            break
+    print("  前 3 个命中行:")
+    for r in rows_f[:3]:
+        print("   ", r)
+    # 与“无筛选游标里手工过滤”的结果逐行一致（保留上传顺序、文件内行序与重复行）
+    expected_f = [r for r in rows_c
+                  if r["station_id"] == sid_filter
+                  and start <= r["observed_at"] < end]
+    assert rows_f == expected_f, (
+        f"筛选结果 {len(rows_f)} 行与手工过滤 {len(expected_f)} 行不一致")
+    print(f"  筛选结果与手工过滤完全一致（{len(rows_f)} 行，含重复行）")
+
+    # 时段完全在数据之外：索引确定不命中，创建时不打开任何文件
+    far = _create_filtered_checked(
+        cli, sid_filter, "2027-01-01T00:00:00Z", "2027-01-02T00:00:00Z")
+    print(f"  时段完全在数据外：候选文件 {far['snapshot_files']} 个，"
+          f"索引跳过 {far['files_skipped']} 个")
+    assert far["snapshot_files"] == 0 and far["files_skipped"] > 0
+    _, empty_page = cli.call("GET", f"/cursors/{far['cursor_id']}/pages?limit=10")
+    assert empty_page["exhausted"] and empty_page["returned"] == 0
+    cli.call("POST", f"/cursors/{far['cursor_id']}/close")
+
+    section("10. 显式关闭游标，触发无引用旧文件回收")
     _, closed = cli.call("POST", f"/cursors/{cursor_b}/close")
     print(f"  关闭游标 B，回收: {closed['reclaimed']}")
     _, closed = cli.call("POST", f"/cursors/{cursor_a}/close")
     print(f"  关闭游标 A，回收: {closed['reclaimed']}")
+    _, closed = cli.call("POST", f"/cursors/{cursor_f}/close")
+    print(f"  关闭筛选游标 F，回收: {closed['reclaimed']}")
     _, rec = cli.call("POST", "/merges/reclaim")
     print(f"  再次回收: {rec['reclaimed']}")
     _, listing = cli.call("GET", "/files")
@@ -303,6 +371,25 @@ def cmd_restart_check(args) -> None:
             print(f"  重启后游标 B 又读出 {len(rows)} 行并耗尽")
             _, closed = cli.call("POST", f"/cursors/{cid}/close")
             print(f"  关闭后回收: {closed['reclaimed']}")
+
+    # 筛选游标在重启后按原始行位置续读：进度必须连续，不重不漏
+    fid = state.get("cursor_f")
+    if fid:
+        _, cursors_list = cli.call("GET", "/cursors")
+        match = next((c for c in cursors_list["cursors"]
+                      if c["cursor_id"] == fid), None)
+        if match is not None and not match["closed"]:
+            section("筛选游标重启后续读（按原始行位置保存进度）")
+            print(f"  重启前: matched={match['matched_rows']}, "
+                  f"rows_read={match['rows_read']}")
+            rows = drain_cursor(cli, fid)
+            flt = match["filter"]
+            for r in rows:
+                assert r["station_id"] == flt["station_id"]
+                assert flt["start"] <= r["observed_at"] < flt["end"]
+            print(f"  重启后又读出 {len(rows)} 行命中行，全部满足筛选条件")
+            _, closed = cli.call("POST", f"/cursors/{fid}/close")
+            print(f"  关闭筛选游标后回收: {closed['reclaimed']}")
 
     _, rec = cli.call("POST", "/merges/reclaim")
     print(f"  重启后继续回收无引用旧文件: {rec['reclaimed']}")

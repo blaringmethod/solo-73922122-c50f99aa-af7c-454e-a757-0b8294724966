@@ -104,6 +104,18 @@ print('创建持锁游标:', cur['cursor_id'], '快照行数:', cur['snapshot_ro
 page=json.load(urllib.request.urlopen(
   'http://127.0.0.1:8000/cursors/%s/pages?limit=10'%%cur['cursor_id']))
 print('先读 10 行，remaining =', page['remaining'])
+# 再建一个筛选游标（ST-001，2026-11-13 全天），只读一页后重启
+f=json.load(urllib.request.urlopen(urllib.request.Request(
+  'http://127.0.0.1:8000/cursors',method='POST',
+  data=json.dumps({'station_id':'ST-001',
+                   'start':'2026-11-13T00:00:00Z',
+                   'end':'2026-11-14T00:00:00Z'}).encode(),
+  headers={'Content-Type':'application/json'})))
+open('/data/hold-filter-cursor.txt','w').write(f['cursor_id'])
+fp=json.load(urllib.request.urlopen(
+  'http://127.0.0.1:8000/cursors/%s/pages?limit=3'%%f['cursor_id']))
+print('筛选游标:', f['cursor_id'], '候选文件:', f['snapshot_files'],
+      '索引跳过:', f['files_skipped'], '重启前已读:', fp['returned'])
 "
 $COMPOSE kill -s KILL lakehouse
 echo "进程已被 SIGKILL（模拟切换/回收中退出）"
@@ -128,6 +140,22 @@ print('重启后续读', len(rows), '行，连同重启前 10 行共', total, '�
 r=json.load(urllib.request.urlopen(urllib.request.Request(
   'http://127.0.0.1:8000/cursors/%s/close'%%cid,method='POST',data=b'{}')))
 print('关闭后回收文件:', r['reclaimed'])
+# 筛选游标：重启后按原始行位置续读，仍然只返回 ST-001 且行序连续
+fcid=open('/data/hold-filter-cursor.txt').read().strip()
+frows=[]
+ftotal=None
+while True:
+  p=json.load(urllib.request.urlopen(
+    'http://127.0.0.1:8000/cursors/%s/pages?limit=4'%%fcid))
+  frows += p['rows']
+  ftotal=p['total_rows']
+  if p['exhausted']: break
+assert all(x['station_id']=='ST-001' for x in frows)
+assert all('2026-11-13T00:00:00+00:00' <= x['observed_at'] < '2026-11-14T00:00:00+00:00'
+           for x in frows)
+print('筛选游标重启后续读', len(frows), '行命中行，连同重启前 3 行共', ftotal, '行')
+json.load(urllib.request.urlopen(urllib.request.Request(
+  'http://127.0.0.1:8000/cursors/%s/close'%%fcid,method='POST',data=b'{}')))
 files=json.load(urllib.request.urlopen('http://127.0.0.1:8000/files'))['files']
 assert all(f['status']=='active' for f in files)
 print('现用文件均未被误删')

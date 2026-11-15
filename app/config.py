@@ -18,4 +18,7 @@ AUTO_MERGE_ON_START = os.environ.get("AUTO_MERGE_ON_START", "false").lower() == 
 DEFAULT_PAGE_LIMIT = int(os.environ.get("DEFAULT_PAGE_LIMIT", "1000"))
 MAX_PAGE_LIMIT = int(os.environ.get("MAX_PAGE_LIMIT", "100000"))
 
+# 筛选扫描时每批读取的行数（控制单批内存，与文件大小无关）
+FILTER_BATCH_ROWS = int(os.environ.get("FILTER_BATCH_ROWS", "65536"))
+
 CANONICAL_COLUMNS = ("station_id", "observed_at", "temperature")
